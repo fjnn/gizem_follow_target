@@ -1,0 +1,13 @@
+[package]
+title = "Gizem Follow Target"
+version = "1.0.0"
+description = "Franka follow target with Joystick"
+
+# Simplified module definition
+[[python.module]]
+name = "gizem_follow_target"
+
+# Use the 'omni.ext' table to define the entry point
+[omni.ext]
+python.module = "gizem_follow_target"
+python.class = "GizemFollowTargetExtension"
