@@ -15,8 +15,9 @@ import omni.usd
 from omni.kit.viewport.utility import get_active_viewport_window
 
 GRIPPER_BTN = 30
-CAM_ZOOM_AXIS = 6
-CAM_ROT_AXIS = 7
+CAM_ZOOM_AXIS = 5
+CAM_HOR_ROT_AXIS = 7
+CAM_VER_ROT_AXIS = 6
 
 class JoySubscriberNode(Node):
     """Minimal rclpy node that lives inside Isaac's Python process."""
@@ -141,7 +142,7 @@ class FollowTarget(BaseSample):
             self._cube_pos += np.array([dx, dy, dz])
 
             # Camera control — only move if axis is meaningfully deflected (deadzone)
-            if abs(axes[CAM_ZOOM_AXIS]) > 0.1 or abs(axes[CAM_ROT_AXIS]) > 0.1:
+            if abs(axes[CAM_ZOOM_AXIS]) > 0.1 or abs(axes[CAM_HOR_ROT_AXIS]) > 0.1 or abs(axes[CAM_VER_ROT_AXIS]) > 0.1:
                 self._update_camera(axes)
 
         self._target_cube.set_world_pose(position=self._cube_pos)
@@ -181,10 +182,11 @@ class FollowTarget(BaseSample):
     
     def _update_camera(self, axes):
         self._cam_radius = float(np.clip(
-            self._cam_radius + axes[CAM_ZOOM_AXIS] * self._cam_zoom_speed,
+            self._cam_radius - axes[CAM_ZOOM_AXIS] * self._cam_zoom_speed,
             0.3, 15.0
         ))
-        self._cam_azimuth += axes[CAM_ROT_AXIS] * self._cam_rot_speed
+        self._cam_azimuth += axes[CAM_HOR_ROT_AXIS] * self._cam_rot_speed
+        self._cam_elevation += axes[CAM_VER_ROT_AXIS] * self._cam_rot_speed
 
         cos_el = np.cos(self._cam_elevation)
         x = float(self._cam_radius * cos_el * np.cos(self._cam_azimuth))
