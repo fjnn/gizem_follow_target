@@ -1,11 +1,15 @@
 from isaacsim.examples.interactive.base_sample import BaseSample
 from isaacsim.robot.manipulators.examples.franka.controllers.rmpflow_controller import RMPFlowController
 from isaacsim.robot.manipulators.examples.franka.tasks import FollowTarget as FollowTargetTask
+from isaacsim.core.utils.types import ArticulationAction
 
 import rclpy # Isaac's bundled rclpy — no import tricks needed
 from rclpy.node import Node
 from sensor_msgs.msg import Joy
 import numpy as np
+
+
+GRIPPER_BTN = 30
 
 class JoySubscriberNode(Node):
     """Minimal rclpy node that lives inside Isaac's Python process."""
@@ -18,7 +22,7 @@ class JoySubscriberNode(Node):
     def _cb(self, msg: Joy):
         self.axes   = list(msg.axes)
         self.buttons = list(msg.buttons)
-        print("Joy-axis0: ", self.axes[0])
+        print("button-axis30: ", self.buttons[30])
 
 class FollowTarget(BaseSample):
     def __init__(self) -> None:
@@ -54,6 +58,11 @@ class FollowTarget(BaseSample):
         )
         self._articulation_controller = my_franka.get_articulation_controller()
 
+        # Joystick - gripper thingy
+        self._gripper_open = False          # current gripper state
+        self._prev_gripper_btn = False         # last seen state of button[32]
+        self._gripper_joint_names = ["panda_finger_joint1", "panda_finger_joint2"]
+
         # Target cube
         target_name = self._task_params["target_name"]["value"]
         self._target_cube = self._world.scene.get_object(target_name)
@@ -61,12 +70,23 @@ class FollowTarget(BaseSample):
         self._cube_pos = np.array(current_pos, dtype=np.float64)
         print(f"[FollowTarget] Cube init pos: {self._cube_pos}")
 
+        # Get finger joint indices once at load time
+        dof_names = my_franka.dof_names
+        print(f"[DOF names] {dof_names}")  # keep this until you've confirmed indices
+        self._finger_idx = [
+            dof_names.index("panda_finger_joint1"),
+            dof_names.index("panda_finger_joint2"),
+        ]
+        print(f"[Gripper] Finger joint indices: {self._finger_idx}")
+
         # Init rclpy once (guard against double-init if scene reloads)
         if not rclpy.ok():
             rclpy.init()
         self._joy_node = JoySubscriberNode()
 
-        self._joy_speed = 0.005   # m per physics step — tune this
+        self._joy_speed = 0.05   # m per physics step — tune this
+
+        
 
     async def _on_follow_target_event_async(self, val):
         world = self.get_world()
@@ -80,11 +100,22 @@ class FollowTarget(BaseSample):
         # 1. Pump ROS2 callbacks (non-blocking)
         rclpy.spin_once(self._joy_node, timeout_sec=0)
 
+        # --- Gripper toggle (debounced) ---
+        buttons = self._joy_node.buttons
+        if len(buttons) > 32:
+            gripper_btn = bool(buttons[GRIPPER_BTN])
+            # Only act on the rising edge (press, not hold)
+            if gripper_btn and not self._prev_gripper_btn:
+                self._gripper_open = not self._gripper_open
+                self._apply_gripper(self._gripper_open)
+            self._prev_gripper_btn = gripper_btn  
+
+
         # 2. Map axes → delta XYZ
         #    Standard gamepad layout (verify with `ros2 topic echo /joy`):
         #      axes[0] = left stick horizontal  → Y world axis
         #      axes[1] = left stick vertical    → X world axis
-        #      axes[3] = right stick vertical   → Z world axis  (up/down)
+        #      axes[2] = right stick vertical   → Z world axis  (up/down)
         axes = self._joy_node.axes
         if len(axes) >= 4:
             dx =  axes[1] * self._joy_speed
@@ -106,6 +137,29 @@ class FollowTarget(BaseSample):
             ]["orientation"],
         )
         self._articulation_controller.apply_action(actions)
+
+    def _apply_gripper(self, open: bool):
+        from isaacsim.core.utils.types import ArticulationAction
+        import numpy as np
+
+        target = 0.04 if open else 0.0
+
+        # Build a full-length array of None, set only the finger joints
+        num_dofs = len(self._articulation_controller._articulation_view.dof_names)
+        joint_positions = [None] * num_dofs
+        for idx in self._finger_idx:
+            joint_positions[idx] = target
+
+        action = ArticulationAction(joint_positions=np.array(
+            [t if t is not None else 0.0 for t in joint_positions],   # can't pass None in np array
+        ))
+        # Only the finger indices will be written — but we need the joint_indices arg:
+        action = ArticulationAction(
+            joint_positions=np.array([target, target]),
+            joint_indices=np.array(self._finger_idx),
+        )
+        self._articulation_controller.apply_action(action)
+        print(f"[Gripper] {'OPEN' if open else 'CLOSED'} (joints {self._finger_idx} → {target})")
 
     def _on_add_obstacle_event(self): ## No need so far but keep for future
         world = self.get_world()
