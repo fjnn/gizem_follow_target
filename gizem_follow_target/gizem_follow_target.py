@@ -84,7 +84,7 @@ class FollowTarget(BaseSample):
             rclpy.init()
         self._joy_node = JoySubscriberNode()
 
-        self._joy_speed = 0.05   # m per physics step — tune this
+        self._joy_speed = 0.01   # m per physics step — tune this
 
         
 
@@ -120,7 +120,7 @@ class FollowTarget(BaseSample):
         if len(axes) >= 4:
             dx =  axes[1] * self._joy_speed
             dy =  axes[0] * self._joy_speed
-            dz =  axes[2] * self._joy_speed
+            dz =  axes[2] * 0.5*self._joy_speed
             self._cube_pos += np.array([dx, dy, dz])
 
         # 3. Move target cube
