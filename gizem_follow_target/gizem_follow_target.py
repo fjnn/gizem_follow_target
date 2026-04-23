@@ -20,7 +20,7 @@ class JoySubscriberNode(Node):
         self.buttons = list(msg.buttons)
         print("Joy-axis0: ", self.axes[0])
 
-class GizemFollowTarget(BaseSample):
+class FollowTarget(BaseSample):
     def __init__(self) -> None:
         super().__init__()
         self._controller = None
@@ -151,3 +151,4 @@ class GizemFollowTarget(BaseSample):
         data_logger.save(log_path=log_path)
         data_logger.reset()
         return
+
