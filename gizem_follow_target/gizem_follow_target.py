@@ -8,8 +8,15 @@ from rclpy.node import Node
 from sensor_msgs.msg import Joy
 import numpy as np
 
+# # Imports for camera control - done by viewport
+from pxr import Gf, UsdGeom
+from isaacsim.core.prims import XFormPrim
+import omni.usd
+from omni.kit.viewport.utility import get_active_viewport_window
 
 GRIPPER_BTN = 30
+CAM_ZOOM_AXIS = 6
+CAM_ROT_AXIS = 7
 
 class JoySubscriberNode(Node):
     """Minimal rclpy node that lives inside Isaac's Python process."""
@@ -22,7 +29,7 @@ class JoySubscriberNode(Node):
     def _cb(self, msg: Joy):
         self.axes   = list(msg.axes)
         self.buttons = list(msg.buttons)
-        print("button-axis30: ", self.buttons[30])
+        # print("GRIPPER_BTN: ", self.buttons[GRIPPER_BTN])
 
 class FollowTarget(BaseSample):
     def __init__(self) -> None:
@@ -63,6 +70,22 @@ class FollowTarget(BaseSample):
         self._prev_gripper_btn = False         # last seen state of button[32]
         self._gripper_joint_names = ["panda_finger_joint1", "panda_finger_joint2"]
 
+        # --- Camera state (spherical coords around world origin) ---
+        self._cam_radius     = 2.5
+        self._cam_azimuth    = 0.785
+        self._cam_elevation  = 0.523
+        self._cam_zoom_speed = 0.1
+        self._cam_rot_speed  = 0.03
+        self._cam_api_inspected  = False
+        self._cam_state_warned   = False
+        vp_window = get_active_viewport_window()
+        if vp_window is not None:
+            self._cam_prim_path = str(vp_window.viewport_api.camera_path)
+            print(f"[Camera] Active camera prim: {self._cam_prim_path}")
+        else:
+            self._cam_prim_path = "/OmniverseKit_Persp"
+            print("[Camera] No viewport window found, using default path")
+
         # Target cube
         target_name = self._task_params["target_name"]["value"]
         self._target_cube = self._world.scene.get_object(target_name)
@@ -86,8 +109,6 @@ class FollowTarget(BaseSample):
 
         self._joy_speed = 0.01   # m per physics step — tune this
 
-        
-
     async def _on_follow_target_event_async(self, val):
         world = self.get_world()
         if val:
@@ -110,23 +131,22 @@ class FollowTarget(BaseSample):
                 self._apply_gripper(self._gripper_open)
             self._prev_gripper_btn = gripper_btn  
 
-
-        # 2. Map axes → delta XYZ
-        #    Standard gamepad layout (verify with `ros2 topic echo /joy`):
-        #      axes[0] = left stick horizontal  → Y world axis
-        #      axes[1] = left stick vertical    → X world axis
-        #      axes[2] = right stick vertical   → Z world axis  (up/down)
+        # 2. Map axes → delta XYZ and camera control
         axes = self._joy_node.axes
-        if len(axes) >= 4:
-            dx =  axes[1] * self._joy_speed
-            dy =  axes[0] * self._joy_speed
-            dz =  axes[2] * 0.5*self._joy_speed
+        if len(axes) >= 8:
+            # EE target movement
+            dx = axes[1] * self._joy_speed
+            dy = axes[0] * self._joy_speed
+            dz = axes[2] * 0.5 * self._joy_speed
             self._cube_pos += np.array([dx, dy, dz])
 
-        # 3. Move target cube
+            # Camera control — only move if axis is meaningfully deflected (deadzone)
+            if abs(axes[CAM_ZOOM_AXIS]) > 0.1 or abs(axes[CAM_ROT_AXIS]) > 0.1:
+                self._update_camera(axes)
+
         self._target_cube.set_world_pose(position=self._cube_pos)
 
-        # 4. RMPFlow: Franka follows cube
+        # RMPFlow: Franka follows cube - Keep it at the last
         observations = self._world.get_observations()
         actions = self._controller.forward(
             target_end_effector_position=observations[
@@ -139,8 +159,6 @@ class FollowTarget(BaseSample):
         self._articulation_controller.apply_action(actions)
 
     def _apply_gripper(self, open: bool):
-        from isaacsim.core.utils.types import ArticulationAction
-        import numpy as np
 
         target = 0.04 if open else 0.0
 
@@ -160,6 +178,86 @@ class FollowTarget(BaseSample):
         )
         self._articulation_controller.apply_action(action)
         print(f"[Gripper] {'OPEN' if open else 'CLOSED'} (joints {self._finger_idx} → {target})")
+    
+    def _update_camera(self, axes):
+        self._cam_radius = float(np.clip(
+            self._cam_radius + axes[CAM_ZOOM_AXIS] * self._cam_zoom_speed,
+            0.3, 15.0
+        ))
+        self._cam_azimuth += axes[CAM_ROT_AXIS] * self._cam_rot_speed
+
+        cos_el = np.cos(self._cam_elevation)
+        x = float(self._cam_radius * cos_el * np.cos(self._cam_azimuth))
+        y = float(self._cam_radius * cos_el * np.sin(self._cam_azimuth))
+        z = float(self._cam_radius * np.sin(self._cam_elevation))
+
+        # Get the viewport window fresh each call — avoids stale references
+        from omni.kit.viewport.utility import get_active_viewport_window
+        vp_window = get_active_viewport_window()
+        if vp_window is None:
+            return
+
+        vp_api = vp_window.viewport_api
+
+        # Print available methods once for debugging (remove after confirming)
+        if not hasattr(self, '_cam_api_inspected'):
+            print("[Camera API methods]", [m for m in dir(vp_api) if 'cam' in m.lower() or 'position' in m.lower()])
+            self._cam_api_inspected = True
+
+        # Try the camera_state approach (Isaac Sim 4.x / 5.x)
+        try:
+            from omni.kit.viewport.utility.camera_state import ViewportCameraState
+            cam_state = ViewportCameraState(vp_api.camera_path, vp_api)
+            cam_state.set_position_world(Gf.Vec3d(x, y, z), True)
+            cam_state.set_target_world(Gf.Vec3d(0.0, 0.0, 0.0), True)
+            return
+        except Exception as e:
+            if not hasattr(self, '_cam_state_warned'):
+                print(f"[Camera] ViewportCameraState failed: {e}")
+                self._cam_state_warned = True
+
+        # Fallback: write directly to the camera prim the viewport is currently using
+        try:
+            cam_path = str(vp_api.camera_path)
+            print(f"[Camera] Active camera path: {cam_path}")  # remove after confirming
+            self._cam_prim_path = cam_path
+            self._write_camera_prim(x, y, z)
+        except Exception as e:
+            print(f"[Camera] Fallback also failed: {e}")
+
+    def _write_camera_prim(self, x, y, z):
+        """Write look-at transform directly to the USD camera prim."""
+        stage = omni.usd.get_context().get_stage()
+        cam_prim = stage.GetPrimAtPath(self._cam_prim_path)
+        if not cam_prim.IsValid():
+            print(f"[Camera] Still invalid prim at: {self._cam_prim_path}")
+            # Last resort — print ALL camera prims in the stage
+            for p in stage.Traverse():
+                if p.GetTypeName() == "Camera":
+                    print(f"  Found camera prim: {p.GetPath()}")
+            return
+
+        cam_pos  = np.array([x, y, z])
+        fwd      = -cam_pos / np.linalg.norm(cam_pos)       # look toward origin
+        world_up = np.array([0.0, 0.0, 1.0])
+        right    = np.cross(fwd, world_up)
+        right   /= np.linalg.norm(right)
+        up       = np.cross(right, fwd)
+
+        m = Gf.Matrix4d(
+            float(right[0]),  float(right[1]),  float(right[2]),  0.0,
+            float(up[0]),     float(up[1]),     float(up[2]),     0.0,
+            float(-fwd[0]),   float(-fwd[1]),   float(-fwd[2]),   0.0,
+            x,                y,                z,                1.0,
+        )
+
+        xform = UsdGeom.Xformable(cam_prim)
+        for op in xform.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTransform:
+                op.Set(m)
+                return
+        xform.ClearXformOpOrder()
+        xform.AddTransformOp().Set(m)
 
     def _on_add_obstacle_event(self): ## No need so far but keep for future
         world = self.get_world()
